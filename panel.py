@@ -301,6 +301,50 @@ def reset_device():
         return jsonify({"status": "success", "message": f"Device reset successful for {key}"})
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# ======================
+# GENERATE CUSTOM KEY
+# ======================
+@app.route("/customkey")
+def custom_key():
+    custom_name = request.args.get("name")
+    duration = request.args.get("duration", "12h")
+    now = time.time()
+
+    if not custom_name:
+        return jsonify({"status": "error", "message": "Custom key name is missing"}), 400
+
+    # Linisin ang input (alisin ang mga spaces para hindi magka-error sa URL)
+    key = custom_name.strip().replace(" ", "-")
+    expiry_seconds = convert_duration(duration)
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # Check muna kung may kaparehas na susing buhay pa sa database
+        cur.execute("SELECT key_code FROM keys WHERE key_code = %s;", (key,))
+        exist = cur.fetchone()
+        
+        if exist:
+            cur.close()
+            conn.close()
+            return jsonify({"status": "error", "message": "Key name already exists!"}), 409
+
+        # I-save sa Supabase
+        cur.execute("""
+            INSERT INTO keys (key_code, expiry, device, revoked, login_time)
+            VALUES (%s, %s, NULL, FALSE, NULL);
+        """, (key, now + expiry_seconds))
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        send_telegram_alert(f"🎁 *Custom Key Created*\nKey: `{key}`\nDuration: `{duration}`")
+        return jsonify({"status": "success", "key": key, "expires_in": expiry_seconds})
+        
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
         
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
