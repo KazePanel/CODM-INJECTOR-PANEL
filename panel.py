@@ -13,13 +13,13 @@ app = Flask(__name__)
 CORS(app)
 
 # ======================
-# CONSTANTS & LOCAL MEMORY
+# CONSTANTS & LOCAL MEMORY (RAM)
 # ======================
 TOKEN_EXPIRY = 5       # seconds for token expiry
 COOLDOWN = 120         # anti-spam cooldown
 KEY_LIMIT = 120        # seconds before same IP can generate another key
 
-# Temporary storage sa RAM (Mabubura ito pag nag-restart, pero OK lang kasi tokens/cooldowns lang naman)
+# Temporary storage sa RAM (Para sa tokens, ip_limit, at cooldowns)
 db_cache = {
     "tokens": {},
     "ip_limit": {},
@@ -30,23 +30,23 @@ TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_ID = os.getenv("OWNER_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Eto na lang ang natatanging DB function na kailangan para sa Keys
+# Eto ang koneksyon para sa permanenteng VIP Keys
 def get_db_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL environment variable is missing sa Render!")
     return psycopg2.connect(DATABASE_URL)
-    
+
 # ======================
 # CLEANUP
 # ======================
 def cleanup():
     now = time.time()
-    for t in list(db["tokens"].keys()):
-        if now - db["tokens"][t]["time"] > TOKEN_EXPIRY:
-            del db["tokens"][t]
-    for ip in list(db["ip_limit"].keys()):
-        if now - db["ip_limit"][ip] > KEY_LIMIT:
-            del db["ip_limit"][ip]
+    for t in list(db_cache["tokens"].keys()):
+        if now - db_cache["tokens"][t]["time"] > TOKEN_EXPIRY:
+            del db_cache["tokens"][t]
+    for ip in list(db_cache["ip_limit"].keys()):
+        if now - db_cache["ip_limit"][ip] > KEY_LIMIT:
+            del db_cache["ip_limit"][ip]
 
 # ======================
 # TELEGRAM ALERT
@@ -70,15 +70,11 @@ def send_telegram_alert(message: str):
 # ======================
 def convert_duration(duration: str):
     duration = duration.lower()
-    if duration.endswith("m"):
-        return int(duration[:-1]) * 60
-    if duration.endswith("h"):
-        return int(duration[:-1]) * 3600
-    if duration.endswith("d"):
-        return int(duration[:-1]) * 86400
-    if duration == "lifetime":
-        return 999999999
-    return 1800  # default 30 minutes
+    if duration.endswith("m"): return int(duration[:-1]) * 60
+    if duration.endswith("h"): return int(duration[:-1]) * 3600
+    if duration.endswith("d"): return int(duration[:-1]) * 86400
+    if duration == "lifetime": return 999999999
+    return 1800
 
 # ======================
 # HOME
@@ -97,21 +93,18 @@ def token():
     now = time.time()
     source = request.args.get("src", "site")
 
-    # CHECK COOLDOWN ONLY IF IP ALREADY HAS ONE
     if source != "bot":
-        if ip in db["cooldowns"]:
-            elapsed = now - db["cooldowns"][ip]
+        if ip in db_cache["cooldowns"]:
+            elapsed = now - db_cache["cooldowns"][ip]
             if elapsed < COOLDOWN:
                 return jsonify({
                     "status":"cooldown",
                     "redirect":"https://kazehayamodz-main-page-90wu.onrender.com"
                 })
 
-    # GENERATE TOKEN
     token_id = str(uuid.uuid4())
-    db["tokens"][token_id] = {"ip": ip, "time": now}
+    db_cache["tokens"][token_id] = {"ip": ip, "time": now}
 
-    save_db()
     return jsonify({
         "status":"success",
         "token": token_id
@@ -122,61 +115,45 @@ def token():
 # ======================
 @app.route("/getkey")
 def getkey():
-
     token_id = request.args.get("token")
     source = request.args.get("src", "site")
     duration = request.args.get("duration", "12h")
-
     now = time.time()
 
-    # â— STRICT TOKEN CHECK
     if not token_id:
-        return jsonify({
-            "status": "error",
-            "message": "Missing token"
-        }), 403
+        return jsonify({"status": "error", "message": "Missing token"}), 403
 
-    if token_id not in db["tokens"]:
-        return jsonify({
-            "status": "error",
-            "message": "Token expired. Please generate again."
-        }), 403
+    if token_id not in db_cache["tokens"]:
+        return jsonify({"status": "error", "message": "Token expired. Please generate again."}), 403
 
-    token_data = db["tokens"][token_id]
+    token_data = db_cache["tokens"][token_id]
     ip = token_data["ip"]
 
-    # ðŸ”’ Anti spam check
-    if ip in db["ip_limit"]:
-        wait = int(KEY_LIMIT - (now - db["ip_limit"][ip]))
+    if ip in db_cache["ip_limit"]:
+        wait = int(KEY_LIMIT - (now - db_cache["ip_limit"][ip]))
         if wait > 0:
-            return jsonify({
-                "status": "wait",
-                "message": f"Bypass detected! Try again in main page"
-            }), 403
+            return jsonify({"status": "wait", "message": "Bypass detected! Try again in main page"}), 403
 
-    # ðŸ”‘ KEY PREFIX
     prefix = "Kaze-" if source == "bot" else "KazeFreeKey-"
-
-    key = prefix + ''.join(
-        random.choices(string.ascii_letters + string.digits, k=12)
-    )
-
+    key = prefix + ''.join(random.choices(string.ascii_letters + string.digits, k=12))
     expiry_seconds = convert_duration(duration)
 
-    db["keys"][key] = {
-        "expiry": now + expiry_seconds,
-        "device": None,
-        "revoked": False,
-        "login_time": None
-    }
+    # 💾 DIREKTANG PAG-SAVE SA SUPABASE
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO keys (key_code, expiry, device, revoked, login_time)
+            VALUES (%s, %s, NULL, FALSE, NULL);
+        """, (key, now + expiry_seconds))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Database error: {str(e)}"}), 500
 
-    # set IP cooldown
-    db["ip_limit"][ip] = now
-
-    # remove used token
-    del db["tokens"][token_id]
-
-    save_db()
+    db_cache["ip_limit"][ip] = now
+    del db_cache["tokens"][token_id]
 
     return jsonify({
         "status": "success",
@@ -192,26 +169,51 @@ def verify():
     cleanup()
     key = request.args.get("key")
     device = request.args.get("device")
-    if not key or key not in db["keys"]:
+    
+    if not key or not device: 
         return "invalid"
-    data = db["keys"][key]
-    if data.get("revoked"):
+
+    # 🔍 PAG-BASA MULA SA SUPABASE
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT * FROM keys WHERE key_code = %s;", (key,))
+    data = cur.fetchone()
+
+    if not data:
+        cur.close()
+        conn.close()
+        return "invalid"
+
+    if data["revoked"]:
+        cur.close()
+        conn.close()
         send_telegram_alert(f"*Key Revoked*\nKey: `{key}`\nDevice: `{device}`")
         return "revoked"
+
     if time.time() > data["expiry"]:
+        cur.close()
+        conn.close()
         send_telegram_alert(f"*Key Expired*\nKey: `{key}`\nDevice: `{device}`")
         return "expired"
+
     if data["device"] is None:
-        data["device"] = device
-        data["login_time"] = time.time()
-        save_db()
+        cur.execute("UPDATE keys SET device = %s, login_time = %s WHERE key_code = %s;", (device, time.time(), key))
+        conn.commit()
+        cur.close()
+        conn.close()
         remaining = int(data["expiry"] - time.time())
         send_telegram_alert(f"*Key Used*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{remaining}s`")
         return "valid"
+
     if data["device"] == device:
+        cur.close()
+        conn.close()
         remaining = int(data["expiry"] - time.time())
         send_telegram_alert(f"*Key Used*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{remaining}s`")
         return "valid"
+
+    cur.close()
+    conn.close()
     send_telegram_alert(f"*Key Locked - Device Mismatch*\nKey: `{key}`\nDevice Attempt: `{device}`\nAssigned Device: `{data['device']}`")
     return "locked"
 
@@ -221,11 +223,21 @@ def verify():
 @app.route("/revoke")
 def revoke():
     key = request.args.get("key")
-    if not key or key not in db["keys"]:
+    if not key: 
+        return jsonify({"status": "error", "message": "Key missing"}), 400
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE keys SET revoked = TRUE WHERE key_code = %s;", (key,))
+    conn.commit()
+    count = cur.rowcount
+    cur.close()
+    conn.close()
+    
+    if count == 0:
         return jsonify({"status": "error", "message": "Key not found"}), 404
-    db["keys"][key]["revoked"] = True
-    save_db()
-    send_telegram_alert(f" *Key Revoked*\nKey: `{key}`")
+        
+    send_telegram_alert(f"🚫 *Key Revoked*\nKey: `{key}`")
     return jsonify({"status": "success", "message": f"{key} revoked"})
 
 # ======================
@@ -234,17 +246,15 @@ def revoke():
 @app.route("/list")
 def list_keys():
     cleanup()
-    result = []
-    for key, data in db["keys"].items():
-        if data.get("revoked"):
-            continue
-        if time.time() > data["expiry"]:
-            continue
-        result.append({
-            "key": key,
-            "device": data["device"],
-            "expire_in": int(data["expiry"] - time.time())
-        })
+    now = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT key_code, device, expiry FROM keys WHERE revoked = FALSE AND expiry > %s;", (now,))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    result = [{"key": r["key_code"], "device": r["device"], "expire_in": int(r["expiry"] - now)} for r in rows]
     return jsonify(result)
 
 # ======================
@@ -253,18 +263,18 @@ def list_keys():
 @app.route("/stats")
 def stats():
     cleanup()
-    total = len(db["keys"])
-    active = len([k for k in db["keys"] if not db["keys"][k].get("revoked") and time.time() < db["keys"][k]["expiry"]])
-    expired = total - active
-    return jsonify({
-        "total_keys": total,
-        "active_keys": active,
-        "expired_keys": expired
-    })
+    now = time.time()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM keys;")
+    total = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM keys WHERE revoked = FALSE AND expiry > %s;", (now,))
+    active = cur.fetchone()[0]
+    cur.close()
+    conn.close()
+    
+    return jsonify({"total_keys": total, "active_keys": active, "expired_keys": total - active})
 
-# ======================
-# RUN SERVER
-# ======================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
