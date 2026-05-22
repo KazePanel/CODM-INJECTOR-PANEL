@@ -274,7 +274,34 @@ def stats():
     conn.close()
     
     return jsonify({"total_keys": total, "active_keys": active, "expired_keys": total - active})
-
+    
+# ======================
+# RESET DEVICE KEY
+# ======================
+@app.route("/reset")
+def reset_device():
+    key = request.args.get("key")
+    if not key: 
+        return jsonify({"status": "error", "message": "Key missing"}), 400
+    
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Gagawing NULL ang device para pwedeng gamitin sa ibang cellphone
+        cur.execute("UPDATE keys SET device = NULL, login_time = NULL WHERE key_code = %s;", (key,))
+        conn.commit()
+        count = cur.rowcount
+        cur.close()
+        conn.close()
+        
+        if count == 0:
+            return jsonify({"status": "error", "message": "Key not found"}), 404
+            
+        send_telegram_alert(f"🔄 *Key Device Reset*\nKey: `{key}`")
+        return jsonify({"status": "success", "message": f"Device reset successful for {key}"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+        
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
