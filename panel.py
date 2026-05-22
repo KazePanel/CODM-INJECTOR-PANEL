@@ -2,44 +2,40 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import uuid
 import time
-import json
 import os
 import random
 import string
-import requests  # telegram alerts
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 CORS(app)
 
 # ======================
-# CONSTANTS
+# CONSTANTS & LOCAL MEMORY
 # ======================
 TOKEN_EXPIRY = 5       # seconds for token expiry
-COOLDOWN = 120            # anti-spam cooldown
-KEY_LIMIT = 120         # seconds before same IP can generate another key
-DATA_FILE = "database.json"
+COOLDOWN = 120         # anti-spam cooldown
+KEY_LIMIT = 120        # seconds before same IP can generate another key
+
+# Temporary storage sa RAM (Mabubura ito pag nag-restart, pero OK lang kasi tokens/cooldowns lang naman)
+db_cache = {
+    "tokens": {},
+    "ip_limit": {},
+    "cooldowns": {}
+}
 
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = os.getenv("OWNER_ID")  # int chat_id of owner
+OWNER_ID = os.getenv("OWNER_ID")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# ======================
-# LOAD DB
-# ======================
-if os.path.exists(DATA_FILE):
-    with open(DATA_FILE, "r") as f:
-        db = json.load(f)
-else:
-    db = {
-        "keys": {},
-        "tokens": {},
-        "ip_limit": {},
-        "cooldowns": {}
-    }
-
-def save_db():
-    with open(DATA_FILE, "w") as f:
-        json.dump(db, f, indent=4)
-
+# Eto na lang ang natatanging DB function na kailangan para sa Keys
+def get_db_connection():
+    if not DATABASE_URL:
+        raise ValueError("DATABASE_URL environment variable is missing sa Render!")
+    return psycopg2.connect(DATABASE_URL)
+    
 # ======================
 # CLEANUP
 # ======================
