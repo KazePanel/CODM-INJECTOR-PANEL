@@ -198,16 +198,37 @@ def custom_key():
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ======================
-# VERIFY KEY (MULTI-DEVICE LOGIC)
+# TIME FORMATTER HELPER (Para sa Telegram Notif)
+# ======================
+def format_remaining_time(seconds: int) -> str:
+    if seconds <= 0:
+        return "Expired"
+    if seconds >= 900000000: # Para sa Lifetime keys
+        return "Lifetime"
+        
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    
+    parts = []
+    if days > 0: parts.append(f"{int(days)}d")
+    if hours > 0: parts.append(f"{int(hours)}h")
+    if minutes > 0: parts.append(f"{int(minutes)}m")
+    
+    # Kung mas mababa sa isang minuto ang natitira
+    if not parts: return "Less than 1m"
+        
+    return " ".join(parts)
+
+# ======================
+# VERIFY KEY (UPDATED TELEGRAM NOTIF)
 # ======================
 @app.route("/verify")
 def verify():
     cleanup()
     key = request.args.get("key")
     device = request.args.get("device")
-    
-    if not key or not device: 
-        return "invalid"
+    if not key or not device: return "invalid"
 
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -215,44 +236,50 @@ def verify():
     data = cur.fetchone()
 
     if not data:
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
         return "invalid"
 
     if data["revoked"]:
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
+        send_telegram_alert(f"❌ *Key Revoked Attempt*\nKey: `{key}`\nDevice: `{device}`")
         return "revoked"
 
     if time.time() > data["expiry"]:
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
+        send_telegram_alert(f"❌ *Key Expired Attempt*\nKey: `{key}`\nDevice: `{device}`")
         return "expired"
 
-    # Multi-device logic check via string comma-split
     current_devices = data["device"].split(",") if data["device"] else []
     max_allowed = data.get("max_devices", 1)
+    remaining_seconds = int(data["expiry"] - time.time())
+    time_left_str = format_remaining_time(remaining_seconds)
 
+    # Case 1: Ang device na ito ay naka-login na dati pa (Re-login)
     if device in current_devices:
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
+        device_index = current_devices.index(device) + 1
+        
+        # Pagandahin ang notif depende kung multi-device o single device
+        counter_str = f" ({device_index}/{max_allowed})" if max_allowed > 1 else ""
+        send_telegram_alert(f"✓ *Key Used{counter_str}*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{time_left_str}`")
         return "valid"
 
+    # Case 2: May bakante pang slot para sa bagong device
     if len(current_devices) < max_allowed:
         current_devices.append(device)
         new_device_string = ",".join(current_devices)
         
         cur.execute("UPDATE keys SET device = %s, login_time = %s WHERE key_code = %s;", (new_device_string, time.time(), key))
         conn.commit()
-        cur.close()
-        conn.close()
+        cur.close(); conn.close()
         
-        send_telegram_alert(f"📱 *New Device Linked ({len(current_devices)}/{max_allowed})*\nKey: `{key}`\nDevice: `{device}`")
+        counter_str = f" ({len(current_devices)}/{max_allowed})" if max_allowed > 1 else ""
+        send_telegram_alert(f"✓ *Key Used{counter_str}*\nKey: `{key}`\nDevice: `{device}`\nExpires in: `{time_left_str}`")
         return "valid"
 
-    cur.close()
-    conn.close()
-    send_telegram_alert(f"🔒 *Max Device Limit Reached*\nKey: `{key}`\nAttempt Device: `{device}`")
+    # Case 3: Puno na ang slots (Device Mismatch / Locked)
+    cur.close(); conn.close()
+    send_telegram_alert(f"🔒 *Max Device Limit Reached*\nKey: `{key}`\nAttempt Device: `{device}`\nSlots: `{len(current_devices)}/{max_allowed}`")
     return "locked"
 
 # ======================
